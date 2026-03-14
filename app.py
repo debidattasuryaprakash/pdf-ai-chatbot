@@ -1,5 +1,7 @@
 import os
-from pathlib import Path
+import re
+import tempfile
+from html import escape
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -11,35 +13,7 @@ from langchain_community.vectorstores import Chroma
 
 load_dotenv()
 
-st.set_page_config(page_title="PDF AI Chatbot", page_icon="📄", layout="wide")
-
-PDF_PATH = "documents/sample.pdf"
-CHROMA_DIR = "chroma_db"
-
-
-@st.cache_resource
-def build_vectorstore(pdf_path: str):
-    """Load PDF, split it, embed it, and store it in Chroma."""
-    if not Path(pdf_path).exists():
-        raise FileNotFoundError(f"PDF not found: {pdf_path}")
-
-    loader = PyPDFLoader(pdf_path)
-    documents = loader.load()
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=800,
-        chunk_overlap=100,
-    )
-    chunks = text_splitter.split_documents(documents)
-
-    embeddings = OpenAIEmbeddings()
-
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=CHROMA_DIR,
-    )
-    return vectorstore
+st.set_page_config(page_title="Multi-PDF AI Chatbot", page_icon="📚", layout="wide")
 
 
 @st.cache_resource
@@ -50,8 +24,96 @@ def get_llm():
     )
 
 
-def retrieve_context(vectorstore, query: str, k: int = 4):
+def load_uploaded_pdfs(uploaded_files):
+    all_documents = []
+    temp_paths = []
+
+    for uploaded_file in uploaded_files:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.read())
+            temp_path = tmp_file.name
+            temp_paths.append(temp_path)
+
+        loader = PyPDFLoader(temp_path)
+        documents = loader.load()
+
+        for doc in documents:
+            doc.metadata["source_file"] = uploaded_file.name
+
+        all_documents.extend(documents)
+
+    return all_documents, temp_paths
+
+
+def build_vectorstore_from_uploaded_pdfs(uploaded_files):
+    if not uploaded_files:
+        raise ValueError("No PDFs uploaded.")
+
+    documents, temp_paths = load_uploaded_pdfs(uploaded_files)
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=150,
+    )
+    chunks = text_splitter.split_documents(documents)
+
+    embeddings = OpenAIEmbeddings()
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+    )
+
+    for temp_path in temp_paths:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+    return vectorstore, chunks
+
+
+def is_multi_document_query(query: str) -> bool:
+    normalized_query = query.lower()
+    multi_doc_phrases = [
+        "all uploaded pdf",
+        "all pdf",
+        "all documents",
+        "all uploaded documents",
+        "uploaded pdfs",
+        "uploaded documents",
+        "across all",
+        "compare",
+        "summarize all",
+    ]
+    return any(phrase in normalized_query for phrase in multi_doc_phrases)
+
+
+def retrieve_context(vectorstore, query: str, active_files, k: int = 4):
     docs = vectorstore.similarity_search(query, k=k)
+
+    if active_files and (is_multi_document_query(query) or len({doc.metadata.get("source_file") for doc in docs}) == 1):
+        selected_docs = []
+        seen_keys = set()
+
+        for source_file in active_files:
+            source_docs = vectorstore.similarity_search(
+                query,
+                k=2,
+                filter={"source_file": source_file},
+            )
+            for doc in source_docs:
+                key = (
+                    doc.metadata.get("source_file"),
+                    doc.metadata.get("page"),
+                    doc.page_content,
+                )
+                if key not in seen_keys:
+                    selected_docs.append(doc)
+                    seen_keys.add(key)
+
+        if selected_docs:
+            docs = selected_docs
+
     context = "\n\n".join([doc.page_content for doc in docs])
     return docs, context
 
@@ -60,7 +122,8 @@ def generate_answer(llm, context: str, question: str):
     prompt = f"""
 You are a helpful AI assistant.
 Answer the user's question using only the provided PDF context.
-If the answer is not in the context, say: "I couldn't find that in the PDF."
+If the answer is not in the context, say: "I couldn't find that in the uploaded PDFs."
+When possible, keep the answer concise and factual.
 
 Context:
 {context}
@@ -72,45 +135,164 @@ Question:
     return response.content
 
 
-st.title("📄 PDF AI Chatbot")
-st.caption("Ask questions about your PDF using RAG")
+def split_into_paragraphs(text: str):
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if not paragraphs:
+        paragraphs = [text.strip()] if text.strip() else []
+    return paragraphs
+
+
+def choose_best_paragraph(query: str, text: str):
+    paragraphs = split_into_paragraphs(text)
+    if not paragraphs:
+        return ""
+
+    query_terms = set(re.findall(r"\w+", query.lower()))
+    best_para = paragraphs[0]
+    best_score = -1
+
+    for para in paragraphs:
+        para_terms = set(re.findall(r"\w+", para.lower()))
+        score = len(query_terms.intersection(para_terms))
+        if score > best_score:
+            best_score = score
+            best_para = para
+
+    return best_para
+
+
+def highlight_text(text: str, query: str):
+    safe_text = escape(text)
+    query_terms = sorted(set(re.findall(r"\w+", query)), key=len, reverse=True)
+
+    for term in query_terms:
+        if len(term) < 3:
+            continue
+        pattern = re.compile(re.escape(term), re.IGNORECASE)
+        safe_text = pattern.sub(
+            lambda m: f"<mark>{escape(m.group(0))}</mark>",
+            safe_text,
+        )
+
+    return safe_text
+
+
+def render_sources(docs, query: str):
+    with st.expander("Evidence used for this answer", expanded=True):
+        for i, src in enumerate(docs, start=1):
+            page = src.metadata.get("page", "unknown")
+            source_file = src.metadata.get("source_file", "unknown file")
+            page_display = page + 1 if isinstance(page, int) else page
+
+            best_paragraph = choose_best_paragraph(query, src.page_content)
+            highlighted = highlight_text(best_paragraph, query)
+
+            st.markdown(
+                f"**Source {i}** - File: `{source_file}` | Page: `{page_display}`"
+            )
+
+            st.markdown("**Highlighted paragraph match:**")
+            st.markdown(
+                f"""
+<div style="padding: 12px; border-radius: 8px; background-color: #f5f5f5; margin-bottom: 10px;">
+{highlighted}
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+
+            with st.expander(f"Show full retrieved chunk {i}"):
+                st.text(src.page_content)
+
+
+st.title("📚 Multi-PDF AI Chatbot")
+st.caption("Upload one or more PDFs, then ask questions across all of them.")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-with st.sidebar:
-    st.header("Settings")
-    st.write(f"PDF file: `{PDF_PATH}`")
-    st.write(f"Vector DB: `{CHROMA_DIR}`")
+if "vectorstore_ready" not in st.session_state:
+    st.session_state.vectorstore_ready = False
 
-    if st.button("Clear chat"):
-        st.session_state.messages = []
-        st.rerun()
+if "uploaded_file_names" not in st.session_state:
+    st.session_state.uploaded_file_names = []
+
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
+
+llm = get_llm()
 
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     st.error("OPENAI_API_KEY is not set.")
     st.stop()
 
-try:
-    vectorstore = build_vectorstore(PDF_PATH)
-    llm = get_llm()
-except Exception as e:
-    st.error(f"Startup error: {e}")
+with st.sidebar:
+    st.header("Upload PDFs")
+
+    uploaded_files = st.file_uploader(
+        "Choose one or more PDF files",
+        type="pdf",
+        accept_multiple_files=True,
+    )
+
+    if uploaded_files:
+        st.write("Selected files:")
+        for file in uploaded_files:
+            st.write(f"- {file.name}")
+
+    if st.button("Process PDFs", use_container_width=True):
+        if not uploaded_files:
+            st.warning("Please upload at least one PDF.")
+        else:
+            with st.spinner("Reading PDFs, creating embeddings, and building vector database..."):
+                try:
+                    vectorstore, chunks = build_vectorstore_from_uploaded_pdfs(uploaded_files)
+                    st.session_state.vectorstore = vectorstore
+                    st.session_state.vectorstore_ready = True
+                    st.session_state.uploaded_file_names = [file.name for file in uploaded_files]
+                    st.session_state.messages = []
+                    st.success(f"Processed {len(uploaded_files)} PDF(s) into {len(chunks)} chunks.")
+                except Exception as e:
+                    st.session_state.vectorstore_ready = False
+                    st.session_state.vectorstore = None
+                    st.error(f"Processing failed: {e}")
+
+    if st.button("Clear chat", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+    if st.button("Reset app", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.vectorstore_ready = False
+        st.session_state.vectorstore = None
+        st.session_state.uploaded_file_names = []
+        st.rerun()
+
+    st.divider()
+    st.subheader("Active PDFs")
+    if st.session_state.uploaded_file_names:
+        for name in st.session_state.uploaded_file_names:
+            st.write(f"- {name}")
+    else:
+        st.write("No PDFs processed yet.")
+
+if not st.session_state.vectorstore_ready:
+    st.info("Upload PDF files in the sidebar and click 'Process PDFs' to begin.")
+    st.stop()
+
+vectorstore = st.session_state.vectorstore
+if vectorstore is None:
+    st.error("Vector store is not available. Please process the PDFs again.")
     st.stop()
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message["role"] == "assistant" and message.get("sources"):
-            with st.expander("Sources"):
-                for i, src in enumerate(message["sources"], start=1):
-                    page = src.metadata.get("page", "unknown")
-                    preview = src.page_content[:300].replace("\n", " ")
-                    st.write(f"**Chunk {i} | Page {page + 1 if isinstance(page, int) else page}**")
-                    st.write(preview + "...")
+            render_sources(message["sources"], message.get("query", ""))
 
-user_query = st.chat_input("Ask a question about the PDF")
+user_query = st.chat_input("Ask a question about the uploaded PDFs")
 
 if user_query:
     st.session_state.messages.append({"role": "user", "content": user_query})
@@ -119,23 +301,22 @@ if user_query:
         st.markdown(user_query)
 
     with st.chat_message("assistant"):
-        with st.spinner("Searching the PDF and generating answer..."):
-            docs, context = retrieve_context(vectorstore, user_query)
+        with st.spinner("Searching uploaded PDFs and generating answer..."):
+            docs, context = retrieve_context(
+                vectorstore,
+                user_query,
+                st.session_state.uploaded_file_names,
+            )
             answer = generate_answer(llm, context, user_query)
 
         st.markdown(answer)
-
-        with st.expander("Sources"):
-            for i, src in enumerate(docs, start=1):
-                page = src.metadata.get("page", "unknown")
-                preview = src.page_content[:300].replace("\n", " ")
-                st.write(f"**Chunk {i} | Page {page + 1 if isinstance(page, int) else page}**")
-                st.write(preview + "...")
+        render_sources(docs, user_query)
 
     st.session_state.messages.append(
         {
             "role": "assistant",
             "content": answer,
             "sources": docs,
+            "query": user_query,
         }
     )
