@@ -118,21 +118,65 @@ def retrieve_context(vectorstore, query: str, active_files, k: int = 4):
     return docs, context
 
 
-def generate_answer(llm, context: str, question: str):
+def build_numbered_context(docs):
+    numbered_sections = []
+
+    for i, doc in enumerate(docs, start=1):
+        source_file = doc.metadata.get("source_file", "unknown file")
+        page = doc.metadata.get("page", "unknown")
+        page_display = page + 1 if isinstance(page, int) else page
+
+        numbered_sections.append(
+            f"""[Source {i}]
+File: {source_file}
+Page: {page_display}
+Content:
+{doc.page_content}
+"""
+        )
+
+    return "\n\n".join(numbered_sections)
+
+
+def generate_answer(llm, docs, question: str):
+    numbered_context = build_numbered_context(docs)
+
     prompt = f"""
 You are a helpful AI assistant.
-Answer the user's question using only the provided PDF context.
-If the answer is not in the context, say: "I couldn't find that in the uploaded PDFs."
-When possible, keep the answer concise and factual.
 
-Context:
-{context}
+Answer the user's question using only the provided sources.
+
+Rules:
+1. Cite claims with inline source labels like [Source 1], [Source 2].
+2. If a sentence is supported by multiple sources, cite multiple labels, for example: [Source 1][Source 3]
+3. Do not invent facts not present in the sources.
+4. If the answer is not in the sources, say exactly: "I couldn't find that in the uploaded PDFs."
+5. Keep the answer concise and factual.
+
+Sources:
+{numbered_context}
 
 Question:
 {question}
 """
     response = llm.invoke(prompt)
     return response.content
+
+
+def normalize_citations(answer: str) -> str:
+    answer = re.sub(
+        r"\[\s*Source\s+(\d+)\s*\]",
+        r"[Source \1]",
+        answer,
+        flags=re.IGNORECASE,
+    )
+    answer = re.sub(
+        r"(?<!\[)Source\s+(\d+)(?!\])",
+        r"[Source \1]",
+        answer,
+        flags=re.IGNORECASE,
+    )
+    return answer
 
 
 def split_into_paragraphs(text: str):
@@ -177,8 +221,18 @@ def highlight_text(text: str, query: str):
     return safe_text
 
 
-def render_sources(docs, query: str):
-    with st.expander("Evidence used for this answer", expanded=True):
+def answer_found(answer: str) -> bool:
+    return "i couldn't find that in the uploaded pdfs." not in answer.lower()
+
+
+def render_sources(docs, query: str, found_answer: bool):
+    expander_title = (
+        "Evidence used for this answer"
+        if found_answer
+        else "Closest matching passages retrieved"
+    )
+
+    with st.expander(expander_title, expanded=True):
         for i, src in enumerate(docs, start=1):
             page = src.metadata.get("page", "unknown")
             source_file = src.metadata.get("source_file", "unknown file")
@@ -188,20 +242,22 @@ def render_sources(docs, query: str):
             highlighted = highlight_text(best_paragraph, query)
 
             st.markdown(
-                f"**Source {i}** - File: `{source_file}` | Page: `{page_display}`"
+                f"### Source {i}\n"
+                f"**File:** `{source_file}`  \n"
+                f"**Page:** `{page_display}`"
             )
 
             st.markdown("**Highlighted paragraph match:**")
             st.markdown(
                 f"""
-<div style="padding: 12px; border-radius: 8px; background-color: #f5f5f5; margin-bottom: 10px;">
+<div style="padding: 12px; border-radius: 8px; background-color: #f5f5f5; color: #111827; margin-bottom: 10px; line-height: 1.6;">
 {highlighted}
 </div>
 """,
                 unsafe_allow_html=True,
             )
 
-            with st.expander(f"Show full retrieved chunk {i}"):
+            with st.expander(f"Show full retrieved chunk for Source {i}"):
                 st.text(src.page_content)
 
 
@@ -290,7 +346,11 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message["role"] == "assistant" and message.get("sources"):
-            render_sources(message["sources"], message.get("query", ""))
+            render_sources(
+                message["sources"],
+                message.get("query", ""),
+                answer_found(message["content"]),
+            )
 
 user_query = st.chat_input("Ask a question about the uploaded PDFs")
 
@@ -302,15 +362,16 @@ if user_query:
 
     with st.chat_message("assistant"):
         with st.spinner("Searching uploaded PDFs and generating answer..."):
-            docs, context = retrieve_context(
+            docs, _ = retrieve_context(
                 vectorstore,
                 user_query,
                 st.session_state.uploaded_file_names,
             )
-            answer = generate_answer(llm, context, user_query)
+            answer = generate_answer(llm, docs, user_query)
+            answer = normalize_citations(answer)
 
         st.markdown(answer)
-        render_sources(docs, user_query)
+        render_sources(docs, user_query, answer_found(answer))
 
     st.session_state.messages.append(
         {

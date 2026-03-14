@@ -6,3 +6,4 @@ pypdf
 streamlit
 tiktoken
 python-dotenv
+urllib3<2
